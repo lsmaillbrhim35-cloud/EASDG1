@@ -5,6 +5,7 @@ MT5 Scalping Bot + Dashboard (ملف واحد)
 اختيارية: ALLOW_LIVE=true, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
 """
 import asyncio
+import json
 import os
 import secrets
 import time
@@ -59,6 +60,132 @@ def _tg_send(text):
         return
     data = urllib.parse.urlencode({"chat_id": chat, "text": text}).encode()
     urllib.request.urlopen(f"https://api.telegram.org/bot{token}/sendMessage", data=data, timeout=10)
+
+
+# ---------------------------------------------------------------- المحاكاة (Backtest)
+
+YF = {
+    "EURUSD": "EURUSD=X",
+    "GBPUSD": "GBPUSD=X",
+    "USDJPY": "USDJPY=X",
+    "XAUUSD": "GC=F",  # عقود الذهب الآجلة (قريبة من سعر الذهب الفوري)
+    "BTCUSD": "BTC-USD",
+}
+YF_RANGE = {"1m": "7d", "5m": "30d"}
+
+
+def _fetch_yahoo(sym, tf):
+    url = (
+        "https://query1.finance.yahoo.com/v8/finance/chart/"
+        f"{urllib.parse.quote(YF[sym])}?interval={tf}&range={YF_RANGE[tf]}"
+    )
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    data = json.load(urllib.request.urlopen(req, timeout=25))
+    res = data["chart"]["result"][0]
+    q = res["indicators"]["quote"][0]
+    rows = []
+    for t, o, h, l, c in zip(res["timestamp"], q["open"], q["high"], q["low"], q["close"]):
+        if None in (o, h, l, c):
+            continue
+        rows.append((t, o, h, l, c))
+    return rows
+
+
+def rsi_series(closes, period=14):
+    n = len(closes)
+    out = [50.0] * n
+    if n <= period + 1:
+        return out
+    gains = [0.0] * n
+    losses = [0.0] * n
+    for i in range(1, n):
+        d = closes[i] - closes[i - 1]
+        gains[i] = max(d, 0)
+        losses[i] = max(-d, 0)
+    ag = sum(gains[1 : period + 1]) / period
+    al = sum(losses[1 : period + 1]) / period
+    out[period] = 100.0 if al == 0 else 100 - 100 / (1 + ag / al)
+    for i in range(period + 1, n):
+        ag = (ag * (period - 1) + gains[i]) / period
+        al = (al * (period - 1) + losses[i]) / period
+        out[i] = 100.0 if al == 0 else 100 - 100 / (1 + ag / al)
+    return out
+
+
+def atr_series(hi, lo, cl, period=14):
+    n = len(cl)
+    tr = [0.0] * n
+    for i in range(1, n):
+        tr[i] = max(hi[i] - lo[i], abs(hi[i] - cl[i - 1]), abs(lo[i] - cl[i - 1]))
+    out = [0.0] * n
+    for i in range(period, n):
+        out[i] = sum(tr[i - period + 1 : i + 1]) / period
+    return out
+
+
+def run_backtest(rows, c):
+    """نفس منطق البوت. النتائج بوحدة R (R = مقدار المخاطرة في الصفقة = وقف الخسارة)."""
+    cl = [x[4] for x in rows]
+    hi = [x[2] for x in rows]
+    lo = [x[3] for x in rows]
+    n = len(rows)
+    f, s, t = ema(cl, c["fast"]), ema(cl, c["slow"]), ema(cl, c["trend"])
+    r = rsi_series(cl)
+    a = atr_series(hi, lo, cl)
+    slm, tpm, sp = c["sl_mult"], c["tp_mult"], c["spread"]
+    trades = []
+    i = max(c["trend"], 20) + 20
+    while i < n - 1:
+        side = None
+        if f[i - 1] <= s[i - 1] and f[i] > s[i] and cl[i] > t[i] and 50 < r[i] < 70:
+            side = 1
+        elif f[i - 1] >= s[i - 1] and f[i] < s[i] and cl[i] < t[i] and 30 < r[i] < 50:
+            side = -1
+        if side is None or a[i] <= 0:
+            i += 1
+            continue
+        entry = cl[i]
+        sl = entry - side * slm * a[i]
+        tp = entry + side * tpm * a[i]
+        res = None
+        j = i + 1
+        while j < n:
+            hit_sl = lo[j] <= sl if side == 1 else hi[j] >= sl
+            hit_tp = hi[j] >= tp if side == 1 else lo[j] <= tp
+            if hit_sl:  # لو تحققا معًا في نفس الشمعة نفترض الخسارة (تحفظًا)
+                res = -(slm + sp) / slm
+                break
+            if hit_tp:
+                res = (tpm - sp) / slm
+                break
+            j += 1
+        if res is None:
+            break  # صفقة لم تُغلق قبل نهاية البيانات
+        trades.append(res)
+        i = j + 1
+    nt = len(trades)
+    total = sum(trades)
+    wins = sum(1 for x in trades if x > 0)
+    gw = sum(x for x in trades if x > 0)
+    gl = -sum(x for x in trades if x < 0)
+    cum, run, peak, dd = [], 0.0, 0.0, 0.0
+    for x in trades:
+        run += x
+        cum.append(round(run, 2))
+        peak = max(peak, run)
+        dd = max(dd, peak - run)
+    step = max(1, len(cum) // 200)
+    return {
+        "candles": n,
+        "trades": nt,
+        "win_rate": round(100 * wins / nt, 1) if nt else 0,
+        "total_r": round(total, 2),
+        "avg_r": round(total / nt, 3) if nt else 0,
+        "profit_factor": round(gw / gl, 2) if gl > 0 else None,
+        "max_dd_r": round(dd, 2),
+        "return_pct": round(total * c["risk_pct"], 1),
+        "curve": [0] + cum[::step],
+    }
 
 
 # ---------------------------------------------------------------- البوت
@@ -131,6 +258,7 @@ class Bot:
                     "server": server,
                     "platform": "mt5",
                     "magic": 123456,
+                    "reliability": "regular",
                 }
             )
         if account.state != "DEPLOYED":
@@ -343,6 +471,47 @@ class StartReq(BaseModel):
     tp_mult: Optional[float] = None
 
 
+class BacktestReq(BaseModel):
+    symbol: str = "EURUSD"
+    tf: str = "1m"
+    fast: Optional[int] = None
+    slow: Optional[int] = None
+    trend: Optional[int] = None
+    sl_mult: Optional[float] = None
+    tp_mult: Optional[float] = None
+    spread: Optional[float] = None
+    risk_pct: Optional[float] = None
+
+
+@app.post("/backtest")
+async def backtest(r: BacktestReq, x_auth: Optional[str] = Header(None)):
+    auth(x_auth)
+    if r.symbol not in YF:
+        raise HTTPException(400, "رمز غير مدعوم في المحاكاة")
+    if r.tf not in YF_RANGE:
+        raise HTTPException(400, "فريم غير مدعوم")
+    c = {
+        "fast": r.fast or 9,
+        "slow": r.slow or 21,
+        "trend": r.trend or 100,
+        "sl_mult": r.sl_mult or 1.5,
+        "tp_mult": r.tp_mult or 2.25,
+        "spread": 0.1 if r.spread is None else r.spread,
+        "risk_pct": r.risk_pct or 1.0,
+    }
+    if not (2 <= c["fast"] < c["slow"] < c["trend"] <= 200):
+        raise HTTPException(400, "يجب أن يكون: السريع < البطيء < الاتجاه، والاتجاه ≤ 200")
+    if c["sl_mult"] <= 0 or c["tp_mult"] <= 0 or c["spread"] < 0 or not (0 < c["risk_pct"] <= 10):
+        raise HTTPException(400, "قيم غير صحيحة")
+    try:
+        rows = await asyncio.to_thread(_fetch_yahoo, r.symbol, r.tf)
+    except Exception as e:
+        raise HTTPException(400, f"تعذّر جلب البيانات: {e}")
+    if len(rows) < c["trend"] + 100:
+        raise HTTPException(400, "البيانات المتاحة قليلة")
+    return await asyncio.to_thread(run_backtest, rows, c)
+
+
 @app.get("/", response_class=HTMLResponse)
 def index():
     return PAGE
@@ -495,6 +664,19 @@ canvas{width:100%;height:120px;display:block}
   <button class="n" onclick="askNotif()">تفعيل إشعارات المتصفح</button>
 </div>
 
+<div class="card">
+  <h2>محاكاة الاستراتيجية (Backtest) - بدون حساب أو تكلفة</h2>
+  <div class="grid">
+    <div><label>الرمز</label><select id="btsym"><option>EURUSD</option><option>GBPUSD</option><option>USDJPY</option><option value="XAUUSD">XAUUSD (ذهب)</option><option>BTCUSD</option></select></div>
+    <div><label>الفترة</label><select id="bttf"><option value="1m">فريم 1 دقيقة - آخر 7 أيام</option><option value="5m">فريم 5 دقائق - آخر 30 يومًا</option></select></div>
+    <div><label>تكلفة السبريد (× ATR)</label><input id="btspread" value="0.1" inputmode="decimal"></div>
+    <div><label>المخاطرة لكل صفقة %</label><input id="btrisk" value="1" inputmode="decimal"></div>
+  </div>
+  <button class="b" onclick="runBacktest()">تشغيل المحاكاة (بإعدادات الاستراتيجية أعلاه)</button>
+  <div id="bt"></div>
+  <canvas id="chart2"></canvas>
+</div>
+
 <div class="card"><h2>منحنى الرصيد (Equity)</h2><canvas id="chart"></canvas></div>
 <div class="card"><h2>الصفقات المفتوحة</h2><div id="pos">-</div></div>
 <div class="card"><h2>الصفقات المغلقة (آخر 3 أيام)</h2><div id="hist">-</div></div>
@@ -536,8 +718,8 @@ function notif(lines){
     if(/BUY|SELL|إيقاف|حد الخسارة|إغلاق/.test(l)&&window.Notification&&Notification.permission==='granted'){try{new Notification('MT5 Bot',{body:l})}catch(e){}}
   });
 }
-function draw(vals){
-  const c=document.getElementById('chart');
+function draw(vals,id){
+  const c=document.getElementById(id||'chart');
   c.width=c.clientWidth;c.height=120;
   const x=c.getContext('2d');x.clearRect(0,0,c.width,c.height);
   if(!vals||vals.length<2){x.fillStyle='#8b949e';x.font='13px sans-serif';x.fillText('لا توجد بيانات بعد',10,60);return}
@@ -548,6 +730,17 @@ function draw(vals){
   x.fillStyle='#8b949e';x.font='11px sans-serif';x.fillText(mx.toFixed(2),4,12);x.fillText(mn.toFixed(2),4,c.height-2);
 }
 const cls=n=>n>=0?'pos':'neg';
+async function runBacktest(){
+  err();
+  const el=document.getElementById('bt');
+  el.textContent='جارٍ الحساب... (قد يستغرق حتى دقيقة)';
+  try{
+    const r=await api('/backtest','POST',{symbol:v('btsym'),tf:v('bttf'),fast:parseInt(v('fast')),slow:parseInt(v('slow')),trend:parseInt(v('trend')),sl_mult:parseFloat(v('sl')),tp_mult:parseFloat(v('tp')),spread:parseFloat(v('btspread')),risk_pct:parseFloat(v('btrisk'))});
+    const row=(a,b,c)=>'<div class="row"><span>'+a+'</span><span class="'+(c||'')+'">'+b+'</span></div>';
+    el.innerHTML=row('عدد الشموع',r.candles)+row('عدد الصفقات',r.trades)+row('نسبة الربح',r.win_rate+'%')+row('المجموع (R)',r.total_r,cls(r.total_r))+row('العائد التقريبي',r.return_pct+'%',cls(r.return_pct))+row('معامل الربح',r.profit_factor===null?'-':r.profit_factor)+row('أكبر تراجع (R)',r.max_dd_r)+(r.trades<30?'<div class="neg" style="font-size:13px;padding:6px 0">عدد الصفقات قليل (أقل من 30)، فالنتيجة غير موثوقة.</div>':'');
+    draw(r.curve,'chart2');
+  }catch(e){el.textContent='';err(e)}
+}
 async function loadHist(){
   try{
     const h=await api('/history');
