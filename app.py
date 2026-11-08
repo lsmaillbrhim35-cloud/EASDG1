@@ -1,14 +1,16 @@
 """
-MT5 Scalping Bot + Dashboard (ملف واحد)
+Capital.com Scalping Bot + Dashboard (ملف واحد - بدون أي مكتبات خارجية عدا fastapi و uvicorn)
 تشغيل: uvicorn app:app --host 0.0.0.0 --port $PORT
-متغيرات البيئة المطلوبة: METAAPI_TOKEN, DASHBOARD_PASSWORD
+متغيرات البيئة المطلوبة: DASHBOARD_PASSWORD
 اختيارية: ALLOW_LIVE=true, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
 """
 import asyncio
 import json
 import os
 import secrets
+import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import date, datetime, timedelta, timezone
@@ -17,7 +19,6 @@ from typing import Optional
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-from metaapi_cloud_sdk import MetaApi
 
 # ---------------------------------------------------------------- المؤشرات
 
@@ -68,7 +69,7 @@ YF = {
     "EURUSD": "EURUSD=X",
     "GBPUSD": "GBPUSD=X",
     "USDJPY": "USDJPY=X",
-    "XAUUSD": "GC=F",  # عقود الذهب الآجلة (قريبة من سعر الذهب الفوري)
+    "GOLD": "GC=F",  # عقود الذهب الآجلة (قريبة من سعر الذهب الفوري)
     "BTCUSD": "BTC-USD",
 }
 YF_RANGE = {"1m": "7d", "5m": "30d"}
@@ -188,13 +189,199 @@ def run_backtest(rows, c):
     }
 
 
+# ---------------------------------------------------------------- عميل Capital.com
+
+
+class CapitalError(Exception):
+    def __init__(self, code, msg):
+        super().__init__(f"{code} {msg}")
+        self.code = code
+
+
+class CapitalClient:
+    def __init__(self, api_key, identifier, password, demo):
+        self.base = (
+            "https://demo-api-capital.backend-capital.com" if demo else "https://api-capital.backend-capital.com"
+        )
+        self.api_key = api_key
+        self.identifier = identifier
+        self.password = password
+        self.cst = None
+        self.tok = None
+        self.account_id = None
+        self.lock = threading.Lock()
+        self.last = 0.0
+        self.last_login = 0.0
+
+    def _raw(self, method, path, body=None, params=None, auth=True):
+        url = self.base + path
+        if params:
+            url += "?" + urllib.parse.urlencode(params)
+        headers = {"Content-Type": "application/json", "X-CAP-API-KEY": self.api_key}
+        if auth:
+            headers["CST"] = self.cst or ""
+            headers["X-SECURITY-TOKEN"] = self.tok or ""
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        wait = 0.12 - (time.time() - self.last)  # الحد: 10 طلبات في الثانية
+        if wait > 0:
+            time.sleep(wait)
+        try:
+            with urllib.request.urlopen(req, timeout=25) as r:
+                self.last = time.time()
+                txt = r.read().decode() or "{}"
+                return json.loads(txt), r.headers
+        except urllib.error.HTTPError as e:
+            self.last = time.time()
+            raise CapitalError(e.code, e.read().decode()[:300])
+
+    def _login(self):
+        wait = 1.1 - (time.time() - self.last_login)  # الحد: طلب جلسة واحد في الثانية
+        if wait > 0:
+            time.sleep(wait)
+        data, h = self._raw(
+            "POST",
+            "/api/v1/session",
+            {"identifier": self.identifier, "password": self.password, "encryptedPassword": False},
+            auth=False,
+        )
+        self.last_login = time.time()
+        self.cst = h.get("CST")
+        self.tok = h.get("X-SECURITY-TOKEN")
+        if not self.cst or not self.tok:
+            raise CapitalError(0, "لم يتم استلام رموز الجلسة")
+        self.account_id = data.get("currentAccountId")
+        return data
+
+    def login(self):
+        with self.lock:
+            return self._login()
+
+    def req(self, method, path, body=None, params=None):
+        with self.lock:
+            if not self.cst:
+                self._login()
+            try:
+                return self._raw(method, path, body, params)[0]
+            except CapitalError as e:
+                if e.code == 401:  # الجلسة تنتهي بعد 10 دقائق خمول
+                    self._login()
+                    return self._raw(method, path, body, params)[0]
+                raise
+
+    def account(self):
+        d = self.req("GET", "/api/v1/accounts")
+        accs = d.get("accounts", [])
+        acc = next((a for a in accs if a.get("accountId") == self.account_id), None)
+        if acc is None:
+            acc = next((a for a in accs if a.get("preferred")), accs[0] if accs else None)
+        if not acc:
+            return {}
+        b = acc.get("balance", {})
+        return {
+            "balance": b.get("deposit"),
+            "equity": b.get("balance"),
+            "profit": b.get("profitLoss"),
+            "currency": acc.get("currency"),
+        }
+
+    def positions(self):
+        d = self.req("GET", "/api/v1/positions")
+        out = []
+        for it in d.get("positions", []):
+            p, m = it.get("position", {}), it.get("market", {})
+            out.append(
+                {
+                    "id": p.get("dealId"),
+                    "symbol": m.get("epic"),
+                    "type": p.get("direction"),
+                    "volume": p.get("size"),
+                    "profit": p.get("upl"),
+                }
+            )
+        return out
+
+    def market(self, epic):
+        d = self.req("GET", f"/api/v1/markets/{urllib.parse.quote(epic)}")
+        s, r = d.get("snapshot", {}), d.get("dealingRules", {})
+
+        def g(k):
+            return (r.get(k) or {}).get("value")
+
+        return {
+            "status": s.get("marketStatus"),
+            "bid": s.get("bid"),
+            "offer": s.get("offer"),
+            "digits": int(s.get("decimalPlacesFactor", 5)),
+            "min": g("minDealSize"),
+            "max": g("maxDealSize"),
+            "inc": g("minSizeIncrement"),
+            "min_dist": r.get("minStopOrProfitDistance"),
+        }
+
+    def candles(self, epic, resolution, n):
+        d = self.req("GET", f"/api/v1/prices/{urllib.parse.quote(epic)}", params={"resolution": resolution, "max": n})
+        rows = []
+        for p in d.get("prices", []):
+            def mid(k):
+                x = p[k]
+                return (x["bid"] + x["ask"]) / 2
+
+            rows.append(
+                {
+                    "time": p.get("snapshotTimeUTC") or p.get("snapshotTime"),
+                    "high": mid("highPrice"),
+                    "low": mid("lowPrice"),
+                    "close": mid("closePrice"),
+                }
+            )
+        rows.sort(key=lambda x: x["time"])
+        return rows
+
+    def open(self, epic, direction, size, sl, tp):
+        body = {"epic": epic, "direction": direction, "size": size, "stopLevel": sl, "profitLevel": tp}
+        return self.req("POST", "/api/v1/positions", body).get("dealReference")
+
+    def confirm(self, ref):
+        return self.req("GET", f"/api/v1/confirms/{ref}")
+
+    def close(self, deal_id):
+        return self.req("DELETE", f"/api/v1/positions/{deal_id}")
+
+    def transactions(self, days=3):
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(days=days)
+        f = "%Y-%m-%dT%H:%M:%S"
+        d = self.req(
+            "GET",
+            "/api/v1/history/transactions",
+            params={"from": start.strftime(f), "to": end.strftime(f), "type": "TRADE"},
+        )
+        return d.get("transactions", [])
+
+    def quotes(self, epics):
+        d = self.req("GET", "/api/v1/markets", params={"epics": ",".join(epics)})
+        out = []
+        for m in d.get("markets", []):
+            out.append(
+                {
+                    "symbol": m.get("epic"),
+                    "bid": m.get("bid"),
+                    "offer": m.get("offer"),
+                    "change": m.get("percentageChange"),
+                    "status": m.get("marketStatus"),
+                    "time": str(m.get("updateTimeUTC") or "")[11:19],
+                }
+            )
+        return out
+
+
 # ---------------------------------------------------------------- البوت
 
 
 class Bot:
     def __init__(self):
-        self.account = None
-        self.conn = None
+        self.cl = None
         self.connected = False
         self.running = False
         self.task = None
@@ -209,7 +396,7 @@ class Bot:
         self.day_equity = None
         self.cfg = {
             "symbols": ["EURUSD"],
-            "volume": 0.01,
+            "size": None,  # None = الحد الأدنى لكل رمز تلقائيًا
             "max_loss": 3.0,
             "fast": 9,
             "slow": 21,
@@ -229,61 +416,32 @@ class Bot:
         except Exception as e:
             self.log(f"تيليجرام: {e}")
 
-    async def connect(self, broker, login, password, server, mode):
-        token = os.environ.get("METAAPI_TOKEN")
-        if not token:
-            raise ValueError("METAAPI_TOKEN غير مضبوط في Render")
+    async def connect(self, identifier, api_key, password, mode):
         if mode == "live" and os.environ.get("ALLOW_LIVE") != "true":
             raise ValueError("الحساب الحقيقي معطّل. استخدم Demo.")
         await self.stop()
-        api = MetaApi(token)
-        account = None
+        cl = CapitalClient(api_key, identifier, password, demo=(mode != "live"))
         try:
-            found = await api.metatrader_account_api.get_accounts_with_infinite_scroll_pagination(
-                {"query": str(login)}
+            await asyncio.to_thread(cl.login)
+        except CapitalError as e:
+            raise ValueError(
+                f"فشل تسجيل الدخول ({e}). تأكد من البريد ومفتاح API وكلمة مرور المفتاح، ومن اختيار Demo/Live الصحيح."
             )
-            for a in found:
-                if str(a.login) == str(login) and a.server == server:
-                    account = a
-                    break
-        except Exception as e:
-            self.log(f"بحث الحساب: {e}")
-        if account is None:
-            account = await api.metatrader_account_api.create_account(
-                {
-                    "name": f"{broker}-{login}",
-                    "type": "cloud-g2",
-                    "login": str(login),
-                    "password": password,
-                    "server": server,
-                    "platform": "mt5",
-                    "magic": 123456,
-                    "reliability": "regular",
-                }
-            )
-        if account.state != "DEPLOYED":
-            await account.deploy()
-        self.log("بانتظار اتصال الوسيط...")
-        await account.wait_connected()
-        conn = account.get_rpc_connection()
-        await conn.connect()
-        await conn.wait_synchronized()
-        self.account, self.conn = account, conn
-        self.mode, self.name = mode, f"{broker}-{login}"
+        self.cl, self.mode, self.name = cl, mode, identifier
         self.connected = True
         self.curve = []
         await self.refresh(force=True)
         self.log(f"تم الاتصال ({mode})")
 
     async def refresh(self, force=False):
-        if not (self.connected and self.conn):
+        if not (self.connected and self.cl):
             return
         if not force and time.time() - self.last_refresh < 4:
             return
         self.last_refresh = time.time()
         try:
-            self.info = await self.conn.get_account_information()
-            self.positions = await self.conn.get_positions()
+            self.info = await asyncio.to_thread(self.cl.account)
+            self.positions = await asyncio.to_thread(self.cl.positions)
             eq = self.info.get("equity")
             if eq is not None and (not self.curve or time.time() - self.curve[-1][0] >= 20):
                 self.curve.append([time.time(), eq])
@@ -292,26 +450,27 @@ class Bot:
             self.log(f"تحديث: {e}")
 
     async def history(self):
-        if not (self.connected and self.conn):
+        if not (self.connected and self.cl):
             return []
-        end = datetime.now(timezone.utc) + timedelta(minutes=1)
-        start = end - timedelta(days=3)
-        res = await self.conn.get_deals_by_time_range(start, end)
-        deals = res.get("deals", []) if isinstance(res, dict) else res
+        tx = await asyncio.to_thread(self.cl.transactions, 3)
         out = []
-        for d in deals:
-            if d.get("entryType") != "DEAL_ENTRY_OUT":
+        for t in tx:
+            if "closed" not in str(t.get("note", "")).lower():
                 continue
-            profit = (d.get("profit") or 0) + (d.get("commission") or 0) + (d.get("swap") or 0)
+            try:
+                profit = float(t.get("size"))
+            except (TypeError, ValueError):
+                continue
             out.append(
                 {
-                    "time": str(d.get("time"))[:16],
-                    "symbol": d.get("symbol"),
-                    "type": str(d.get("type", "")).replace("DEAL_TYPE_", ""),
+                    "time": str(t.get("dateUtc") or t.get("date"))[:16].replace("T", " "),
+                    "symbol": t.get("instrumentName"),
+                    "type": "",
                     "profit": round(profit, 2),
                 }
             )
-        return out[-30:][::-1]
+        out.sort(key=lambda x: x["time"], reverse=True)
+        return out[:30]
 
     async def close_all(self):
         if not self.connected:
@@ -320,7 +479,7 @@ class Bot:
         n = 0
         for p in list(self.positions):
             try:
-                await self.conn.close_position(p["id"])
+                await asyncio.to_thread(self.cl.close, p["id"])
                 n += 1
             except Exception as e:
                 self.log(f"فشل إغلاق {p.get('symbol')}: {e}")
@@ -329,7 +488,7 @@ class Bot:
 
     async def start(self, req):
         if not self.connected:
-            raise ValueError("اتصل بحساب MT5 أولاً")
+            raise ValueError("اتصل بحساب Capital.com أولاً")
         if self.running:
             return
         c = dict(self.cfg)
@@ -338,13 +497,26 @@ class Bot:
             if not syms or len(syms) > 5:
                 raise ValueError("اكتب من 1 إلى 5 رموز مفصولة بفاصلة")
             c["symbols"] = syms
-        for k in ("volume", "max_loss", "fast", "slow", "trend", "sl_mult", "tp_mult"):
+        c["size"] = req.get("size")
+        for k in ("max_loss", "fast", "slow", "trend", "sl_mult", "tp_mult"):
             if req.get(k) is not None:
                 c[k] = req[k]
         if not (2 <= c["fast"] < c["slow"] < c["trend"] <= 200):
             raise ValueError("يجب أن يكون: السريع < البطيء < الاتجاه، والاتجاه ≤ 200")
-        if c["volume"] <= 0 or not (0 < c["max_loss"] <= 50) or c["sl_mult"] <= 0 or c["tp_mult"] <= 0:
-            raise ValueError("قيم غير صحيحة (الحجم/الخسارة/SL/TP)")
+        if (c["size"] is not None and c["size"] <= 0) or not (0 < c["max_loss"] <= 50):
+            raise ValueError("قيم غير صحيحة (الحجم/حد الخسارة)")
+        if c["sl_mult"] <= 0 or c["tp_mult"] <= 0:
+            raise ValueError("قيم غير صحيحة (SL/TP)")
+        for sym in c["symbols"]:
+            try:
+                m = await asyncio.to_thread(self.cl.market, sym)
+            except CapitalError as e:
+                raise ValueError(f"الرمز {sym} غير صالح في Capital.com ({e})")
+            if c["size"] is not None and m["min"] is not None and c["size"] < m["min"]:
+                raise ValueError(f"الحد الأدنى للحجم في {sym} هو {m['min']}")
+            if c["size"] is not None and m["max"] and c["size"] > m["max"]:
+                raise ValueError(f"الحد الأقصى للحجم في {sym} هو {m['max']}")
+            self.log(f"{sym}: الحد الأدنى للحجم {m['min']} | السوق {m['status']}")
         self.cfg = c
         self.day = None
         self.running = True
@@ -360,6 +532,25 @@ class Bot:
         if was:
             await self.notify("تم إيقاف البوت")
 
+    def _size(self, m):
+        s = self.cfg["size"] if self.cfg["size"] is not None else m["min"]
+        if s is None:
+            s = 1
+        inc = m.get("inc")
+        if inc:
+            s = round(round(s / inc) * inc, 8)
+        if m.get("min") is not None and s < m["min"]:
+            s = m["min"]
+        return s
+
+    @staticmethod
+    def _min_dist(m, price):
+        r = m.get("min_dist") or {}
+        v, u = r.get("value"), r.get("unit")
+        if v is None:
+            return 0
+        return price * v / 100 if u == "PERCENTAGE" else v
+
     async def _scan(self, sym, state):
         """
         الاستراتيجية (سكالبينغ M1):
@@ -374,44 +565,53 @@ class Bot:
         if time.time() < state["cool"].get(sym, 0):
             return
         need = min(1000, max(300, c["trend"] * 3))
-        candles = await self.account.get_historical_candles(sym, "1m", None, need)
-        candles = sorted(candles, key=lambda x: x["time"])[:-1]  # بدون الشمعة الجارية
+        candles = await asyncio.to_thread(self.cl.candles, sym, "MINUTE", need)
+        candles = candles[:-1]  # بدون الشمعة الجارية
         if len(candles) <= c["trend"] + 20 or candles[-1]["time"] == state["last"].get(sym):
             return
         state["last"][sym] = candles[-1]["time"]
-        cl = [x["close"] for x in candles]
+        closes = [x["close"] for x in candles]
         hi = [x["high"] for x in candles]
         lo = [x["low"] for x in candles]
-        f, s, t = ema(cl, c["fast"]), ema(cl, c["slow"]), ema(cl, c["trend"])
-        r = rsi(cl)
-        a = atr(hi, lo, cl)
+        f, s, t = ema(closes, c["fast"]), ema(closes, c["slow"]), ema(closes, c["trend"])
+        r = rsi(closes)
+        a = atr(hi, lo, closes)
         side = None
-        if f[-2] <= s[-2] and f[-1] > s[-1] and cl[-1] > t[-1] and 50 < r < 70:
+        if f[-2] <= s[-2] and f[-1] > s[-1] and closes[-1] > t[-1] and 50 < r < 70:
             side = "buy"
-        elif f[-2] >= s[-2] and f[-1] < s[-1] and cl[-1] < t[-1] and 30 < r < 50:
+        elif f[-2] >= s[-2] and f[-1] < s[-1] and closes[-1] < t[-1] and 30 < r < 50:
             side = "sell"
-        if not side:
+        if not side or a <= 0:
             return
-        price = await self.conn.get_symbol_price(sym)
-        if price["ask"] - price["bid"] > 0.3 * a:
+        m = await asyncio.to_thread(self.cl.market, sym)
+        if m["status"] != "TRADEABLE":
+            self.log(f"{sym}: السوق مغلق، تجاهل إشارة {side}")
+            return
+        if m["offer"] - m["bid"] > 0.3 * a:
             self.log(f"سبريد عالٍ، تجاهل إشارة {side} على {sym}")
             return
-        try:
-            spec = await self.conn.get_symbol_specification(sym)
-            digits = int(spec.get("digits", 5))
-        except Exception:
-            digits = 5
-        opts = {"comment": "scalp-bot"}
+        price = m["offer"] if side == "buy" else m["bid"]
+        sl_d, tp_d = c["sl_mult"] * a, c["tp_mult"] * a
+        md = self._min_dist(m, price)
+        if md:  # احترام الحد الأدنى لمسافة الوقف/الهدف مع الحفاظ على النسبة بينهما
+            k = max(1.0, md * 1.2 / min(sl_d, tp_d))
+            sl_d, tp_d = sl_d * k, tp_d * k
+        d = m["digits"]
         if side == "buy":
-            p = price["ask"]
-            sl, tp = round(p - c["sl_mult"] * a, digits), round(p + c["tp_mult"] * a, digits)
-            await self.conn.create_market_buy_order(sym, c["volume"], sl, tp, opts)
+            direction = "BUY"
+            sl, tp = round(price - sl_d, d), round(price + tp_d, d)
         else:
-            p = price["bid"]
-            sl, tp = round(p + c["sl_mult"] * a, digits), round(p - c["tp_mult"] * a, digits)
-            await self.conn.create_market_sell_order(sym, c["volume"], sl, tp, opts)
+            direction = "SELL"
+            sl, tp = round(price + sl_d, d), round(price - tp_d, d)
+        size = self._size(m)
+        ref = await asyncio.to_thread(self.cl.open, sym, direction, size, sl, tp)
+        await asyncio.sleep(0.6)
+        conf = await asyncio.to_thread(self.cl.confirm, ref)
         state["cool"][sym] = time.time() + 60
-        await self.notify(f"{side.upper()} {sym} @ {p} SL {sl} TP {tp} RSI {r:.0f}")
+        if conf.get("dealStatus") == "ACCEPTED":
+            await self.notify(f"{direction} {sym} size {size} @ {price} SL {sl} TP {tp} RSI {r:.0f}")
+        else:
+            await self.notify(f"رُفضت الصفقة {sym}: {conf.get('reason') or conf.get('dealStatus')}")
 
     async def _loop(self):
         state = {"last": {}, "cool": {}}
@@ -453,16 +653,15 @@ def auth(token):
 
 
 class ConnectReq(BaseModel):
-    broker: str
-    login: str
+    identifier: str
+    api_key: str
     password: str
-    server: str
     mode: str = "demo"
 
 
 class StartReq(BaseModel):
     symbols: Optional[str] = None
-    volume: Optional[float] = None
+    size: Optional[float] = None
     max_loss: Optional[float] = None
     fast: Optional[int] = None
     slow: Optional[int] = None
@@ -521,7 +720,7 @@ def index():
 async def connect(r: ConnectReq, x_auth: Optional[str] = Header(None)):
     auth(x_auth)
     try:
-        await bot.connect(r.broker, r.login, r.password, r.server, r.mode)
+        await bot.connect(r.identifier.strip(), r.api_key.strip(), r.password, r.mode)
     except Exception as e:
         raise HTTPException(400, str(e))
     return {"ok": True}
@@ -564,6 +763,28 @@ async def history(x_auth: Optional[str] = Header(None)):
         return {"deals": []}
 
 
+_qcache = {"t": 0.0, "key": "", "data": []}
+
+
+@app.get("/prices")
+async def prices(symbols: str = "GOLD,EURUSD,GBPUSD,USDJPY,BTCUSD", x_auth: Optional[str] = Header(None)):
+    auth(x_auth)
+    if not bot.connected:
+        raise HTTPException(400, "اتصل بحساب Capital.com أولاً")
+    syms = [s.strip() for s in symbols.split(",") if s.strip()][:20]
+    if not syms:
+        raise HTTPException(400, "اكتب رمزًا واحدًا على الأقل")
+    key = ",".join(syms)
+    if _qcache["key"] == key and time.time() - _qcache["t"] < 1.5:
+        return {"quotes": _qcache["data"]}
+    try:
+        data = await asyncio.to_thread(bot.cl.quotes, syms)
+    except Exception as e:
+        raise HTTPException(400, str(e))
+    _qcache.update({"t": time.time(), "key": key, "data": data})
+    return {"quotes": data}
+
+
 @app.get("/status")
 async def status(x_auth: Optional[str] = Header(None)):
     auth(x_auth)
@@ -578,6 +799,7 @@ async def status(x_auth: Optional[str] = Header(None)):
         "account": bot.name,
         "balance": i.get("balance"),
         "equity": i.get("equity"),
+        "profit": i.get("profit"),
         "currency": i.get("currency"),
         "positions": [
             {"symbol": p.get("symbol"), "type": str(p.get("type")), "volume": p.get("volume"), "profit": p.get("profit")}
@@ -596,7 +818,7 @@ PAGE = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>MT5 Bot</title>
+<title>Capital Bot</title>
 <style>
 :root{--bg:#0d1117;--card:#161b22;--line:#30363d;--tx:#e6edf3;--mut:#8b949e;--g:#238636;--r:#da3633;--o:#d29922}
 *{box-sizing:border-box}
@@ -617,24 +839,33 @@ button{width:100%;padding:13px;border:0;border-radius:8px;color:#fff;font-size:1
 pre{white-space:pre-wrap;font-size:12px;color:var(--mut);margin:0;direction:ltr;text-align:left}
 canvas{width:100%;height:120px;display:block}
 .pos{color:#3fb950}.neg{color:#f85149}
+.q{display:grid;grid-template-columns:1.2fr 1fr 1fr .9fr .8fr;gap:4px;padding:6px 0;border-bottom:1px solid var(--line);font-size:14px;direction:ltr;text-align:left}
+.qh{color:var(--mut);font-size:12px}
+.q small{color:var(--mut)}
 #err{color:#ff7b72;font-size:14px;min-height:18px}
 </style>
 </head>
 <body>
-<h1>لوحة بوت MT5</h1>
+<h1>لوحة بوت Capital.com</h1>
 <div id="err"></div>
 
 <div class="card">
-  <h2>حساب MT5</h2>
+  <h2>حساب Capital.com</h2>
   <div><span class="dot" id="cdot"></span><span id="ctext">Disconnected</span></div>
   <div id="acc" class="row"></div>
   <div id="bal" class="row"></div>
-  <input id="broker" placeholder="اسم الوسيط">
-  <input id="login" placeholder="رقم الحساب (Login)" inputmode="numeric">
-  <input id="server" placeholder="السيرفر (Server)">
-  <input id="password" type="password" placeholder="كلمة مرور MT5">
+  <input id="email" type="email" placeholder="البريد الإلكتروني لحسابك" autocomplete="off">
+  <input id="apikey" placeholder="مفتاح API (API key)" autocomplete="off">
+  <input id="apipass" type="password" placeholder="كلمة مرور المفتاح (Custom password)" autocomplete="off">
   <select id="mode"><option value="demo">Demo</option><option value="live">Live</option></select>
   <button class="b" onclick="connect()">اتصال</button>
+</div>
+
+<div class="card">
+  <h2>الأسعار اللحظية (تتحدث كل ثانيتين)</h2>
+  <input id="watch" value="GOLD,EURUSD,GBPUSD,USDJPY,BTCUSD" placeholder="رموز المراقبة مفصولة بفاصلة">
+  <div class="q qh"><span>الرمز</span><span>Bid</span><span>Ask</span><span>التغير</span><span>الوقت</span></div>
+  <div id="quotes">اتصل بالحساب لعرض الأسعار</div>
 </div>
 
 <div class="card">
@@ -643,14 +874,14 @@ canvas{width:100%;height:120px;display:block}
   <label>الرموز (حتى 5، مفصولة بفاصلة)</label>
   <input id="symbols" value="EURUSD">
   <div class="chips">
-    <button class="chip" onclick="addSym('XAUUSD')">ذهب XAUUSD</button>
+    <button class="chip" onclick="addSym('GOLD')">ذهب GOLD</button>
     <button class="chip" onclick="addSym('EURUSD')">EURUSD</button>
     <button class="chip" onclick="addSym('GBPUSD')">GBPUSD</button>
     <button class="chip" onclick="addSym('USDJPY')">USDJPY</button>
     <button class="chip" onclick="addSym('BTCUSD')">BTCUSD</button>
   </div>
   <div class="grid">
-    <div><label>الحجم (Lot)</label><input id="volume" value="0.01" inputmode="decimal"></div>
+    <div><label>الحجم (فارغ = الحد الأدنى تلقائيًا)</label><input id="volume" value="" inputmode="decimal"></div>
     <div><label>حد الخسارة اليومي %</label><input id="maxloss" value="3" inputmode="decimal"></div>
     <div><label>EMA السريع</label><input id="fast" value="9" inputmode="numeric"></div>
     <div><label>EMA البطيء</label><input id="slow" value="21" inputmode="numeric"></div>
@@ -667,7 +898,7 @@ canvas{width:100%;height:120px;display:block}
 <div class="card">
   <h2>محاكاة الاستراتيجية (Backtest) - بدون حساب أو تكلفة</h2>
   <div class="grid">
-    <div><label>الرمز</label><select id="btsym"><option>EURUSD</option><option>GBPUSD</option><option>USDJPY</option><option value="XAUUSD">XAUUSD (ذهب)</option><option>BTCUSD</option></select></div>
+    <div><label>الرمز</label><select id="btsym"><option>EURUSD</option><option>GBPUSD</option><option>USDJPY</option><option value="GOLD">GOLD (ذهب)</option><option>BTCUSD</option></select></div>
     <div><label>الفترة</label><select id="bttf"><option value="1m">فريم 1 دقيقة - آخر 7 أيام</option><option value="5m">فريم 5 دقائق - آخر 30 يومًا</option></select></div>
     <div><label>تكلفة السبريد (× ATR)</label><input id="btspread" value="0.1" inputmode="decimal"></div>
     <div><label>المخاطرة لكل صفقة %</label><input id="btrisk" value="1" inputmode="decimal"></div>
@@ -696,7 +927,7 @@ async function api(path,method='GET',body){
   return d;
 }
 function err(e){document.getElementById('err').textContent=e?e.message:''}
-function startBody(){return {symbols:v('symbols'),volume:parseFloat(v('volume')),max_loss:parseFloat(v('maxloss')),fast:parseInt(v('fast')),slow:parseInt(v('slow')),trend:parseInt(v('trend')),sl_mult:parseFloat(v('sl')),tp_mult:parseFloat(v('tp'))}}
+function startBody(){return {symbols:v('symbols'),size:parseFloat(v('volume')),max_loss:parseFloat(v('maxloss')),fast:parseInt(v('fast')),slow:parseInt(v('slow')),trend:parseInt(v('trend')),sl_mult:parseFloat(v('sl')),tp_mult:parseFloat(v('tp'))}}
 function addSym(s){const el=document.getElementById('symbols');const a=el.value.split(',').map(x=>x.trim()).filter(Boolean);const i=a.indexOf(s);if(i>=0)a.splice(i,1);else a.push(s);el.value=a.join(',')}
 function closeAll(){if(confirm('إغلاق كل الصفقات المفتوحة؟'))act('/bot/close_all')}
 function askNotif(){if(window.Notification){Notification.requestPermission().then(p=>alert(p==='granted'?'تم تفعيل الإشعارات (تعمل والصفحة مفتوحة)':'لم يتم السماح'))}else alert('المتصفح لا يدعم الإشعارات')}
@@ -704,8 +935,9 @@ async function connect(){
   err();
   try{
     document.getElementById('ctext').textContent='جارٍ الاتصال...';
-    await api('/connect','POST',{broker:v('broker'),login:v('login'),server:v('server'),password:v('password'),mode:v('mode')});
-    document.getElementById('password').value='';
+    await api('/connect','POST',{identifier:v('email'),api_key:v('apikey'),password:v('apipass'),mode:v('mode')});
+    document.getElementById('apikey').value='';
+    document.getElementById('apipass').value='';
     poll();
   }catch(e){err(e);poll()}
 }
@@ -715,7 +947,7 @@ function notif(lines){
   lines.forEach(l=>{
     if(seen.has(l))return;
     seen.add(l);
-    if(/BUY|SELL|إيقاف|حد الخسارة|إغلاق/.test(l)&&window.Notification&&Notification.permission==='granted'){try{new Notification('MT5 Bot',{body:l})}catch(e){}}
+    if(/BUY|SELL|إيقاف|حد الخسارة|إغلاق|رُفضت/.test(l)&&window.Notification&&Notification.permission==='granted'){try{new Notification('Capital Bot',{body:l})}catch(e){}}
   });
 }
 function draw(vals,id){
@@ -744,8 +976,23 @@ async function runBacktest(){
 async function loadHist(){
   try{
     const h=await api('/history');
-    document.getElementById('hist').innerHTML=h.deals.length?h.deals.map(d=>'<div class="row"><span>'+d.time+' '+d.symbol+' '+d.type+'</span><span class="'+cls(d.profit)+'">'+d.profit+'</span></div>').join(''):'لا توجد صفقات مغلقة';
+    document.getElementById('hist').innerHTML=h.deals.length?h.deals.map(d=>'<div class="row"><span>'+d.time+' '+d.symbol+'</span><span class="'+cls(d.profit)+'">'+d.profit+'</span></div>').join(''):'لا توجد صفقات مغلقة';
   }catch(e){}
+}
+let lastBid={},qdir={},qbusy=false;
+async function loadPrices(){
+  if(!window.isConn||qbusy||locked)return;
+  qbusy=true;
+  try{
+    const d=await api('/prices?symbols='+encodeURIComponent(v('watch')));
+    document.getElementById('quotes').innerHTML=d.quotes.map(q=>{
+      const p=lastBid[q.symbol];
+      if(p!==undefined&&q.bid!==p)qdir[q.symbol]=q.bid>p?'pos':'neg';
+      lastBid[q.symbol]=q.bid;
+      return '<div class="q"><b>'+q.symbol+'</b><span class="'+(qdir[q.symbol]||'')+'">'+q.bid+'</span><span>'+q.offer+'</span><span class="'+cls(q.change||0)+'">'+(q.change==null?'-':q.change+'%')+'</span><small>'+(q.status==='TRADEABLE'?q.time:'مغلق')+'</small></div>';
+    }).join('')||'لا توجد بيانات لهذه الرموز';
+  }catch(e){document.getElementById('quotes').textContent=e.message}
+  qbusy=false;
 }
 async function poll(){
   if(locked)return;
@@ -754,7 +1001,7 @@ async function poll(){
     if(!inited&&s.config){
       inited=true;const c=s.config;
       document.getElementById('symbols').value=c.symbols;
-      document.getElementById('volume').value=c.volume;
+      document.getElementById('volume').value=(c.size===null||c.size===undefined)?'':c.size;
       document.getElementById('maxloss').value=c.max_loss;
       document.getElementById('fast').value=c.fast;
       document.getElementById('slow').value=c.slow;
@@ -762,13 +1009,14 @@ async function poll(){
       document.getElementById('sl').value=c.sl_mult;
       document.getElementById('tp').value=c.tp_mult;
     }
+    window.isConn=s.connected;
     document.getElementById('cdot').className='dot'+(s.connected?' on':'');
     document.getElementById('ctext').textContent=s.connected?'Connected':'Disconnected';
     document.getElementById('rdot').className='dot'+(s.running?' on':'');
     document.getElementById('rtext').textContent=s.running?'Running':'Stopped';
     document.getElementById('acc').textContent=s.connected?s.account+' ('+s.mode+')':'';
-    document.getElementById('bal').textContent=s.balance!=null?'الرصيد: '+s.balance+' '+(s.currency||'')+' | Equity: '+s.equity:'';
-    document.getElementById('pos').innerHTML=s.positions.length?s.positions.map(p=>'<div class="row"><span>'+p.symbol+' '+p.type.replace('POSITION_TYPE_','')+' '+p.volume+'</span><span class="'+cls(p.profit)+'">'+p.profit+'</span></div>').join(''):'لا توجد صفقات';
+    document.getElementById('bal').textContent=s.equity!=null?'Equity: '+s.equity+' '+(s.currency||'')+' | P/L: '+s.profit:'';
+    document.getElementById('pos').innerHTML=s.positions.length?s.positions.map(p=>'<div class="row"><span>'+p.symbol+' '+p.type+' '+p.volume+'</span><span class="'+cls(p.profit)+'">'+p.profit+'</span></div>').join(''):'لا توجد صفقات';
     document.getElementById('log').textContent=s.logs.join('\n');
     draw(s.curve);
     notif(s.logs);
@@ -777,6 +1025,7 @@ async function poll(){
   }catch(e){}
 }
 setInterval(poll,4000);poll();
+setInterval(loadPrices,2000);
 </script>
 </body>
 </html>
